@@ -102,6 +102,7 @@ export default function Comparer() {
         {
           threshold,
           exclusions,
+          includeAA: true,
         },
       );
 
@@ -139,6 +140,7 @@ export default function Comparer() {
           {
             threshold,
             exclusions,
+            includeAA: true,
           },
         );
       }

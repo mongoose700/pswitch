@@ -1,10 +1,10 @@
 // Based on https://github.com/mapbox/pixelmatch/blob/main/index.js,
 // but will be modified to return more quickly if it's not a match
-// and to ignore certain colors that appear in the background
+// and (maybe) to ignore certain colors that appear in the background
 
 type ImageArray = Uint8Array | Uint8ClampedArray;
-type Color = [number, number, number];
-type Rect = [x: number, y: number, w: number, h: number];
+type Color = Readonly<[r: number, g: number, b: number]>;
+type Rect = Readonly<[x: number, y: number, w: number, h: number]>;
 
 export default function stickerMatch(
   image1: ImageArray,
@@ -21,16 +21,17 @@ export default function stickerMatch(
     diffColorAlt = null,
     diffMask = false,
     exclusions = [],
+    failFastThreshold,
   }: {
     threshold?: number;
     alpha?: number;
-    aaColor?: readonly [number, number, number];
-    diffColor?: readonly [number, number, number];
+    aaColor?: Color;
+    diffColor?: Color;
     includeAA?: boolean;
-    diffColorAlt?: readonly [number, number, number] | null;
+    diffColorAlt?: Color | null;
     diffMask?: boolean;
-    exclusions: ReadonlyArray<readonly [number, number, number, number]>;
-
+    exclusions: ReadonlyArray<Readonly<Rect>>;
+    failFastThreshold?: number;
   },
 ) {
   if (!isPixelData(image1) || !isPixelData(image2) || (output && !isPixelData(output))) {
@@ -58,50 +59,54 @@ export default function stickerMatch(
   let diff = 0;
 
   // compare each pixel of one image against the other one
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
 
-      const i = y * width + x;
-      const pos = i * 4;
+  const points = getPoints(width, height);
+  for (const [x, y] of points) {
+    const i = y * width + x;
+    const pos = i * 4;
 
-      const excluded = exclusions.some(([rectX, rectY, rectW, rectH]) => {
-        return (x >= rectX && x < rectX + rectW) && (y >= rectY && y < rectY + rectH);
-      })
-      if (excluded) {
+    const excluded = exclusions.some(([rectX, rectY, rectW, rectH]) => {
+      return (x >= rectX && x < rectX + rectW) && (y >= rectY && y < rectY + rectH);
+    });
+
+    if (excluded) {
+      if (output) {
+        drawGrayPixel(image1, pos, alpha, output)
+      }
+      continue;
+    }
+
+    // squared YUV distance between colors at this pixel position, negative if the img2 pixel is darker
+    const delta = a32[i] === b32[i] ? 0 : colorDelta(image1, image2, pos, pos, false);
+
+    // the color difference is above the threshold
+    if (Math.abs(delta) > maxDelta) {
+      // check it's a real rendering difference or just anti-aliasing
+      const isExcludedAA = !includeAA && (antialiased(image1, x, y, width, height, a32, b32) || antialiased(image2, x, y, width, height, b32, a32));
+      if (isExcludedAA) {
+        // one of the pixels is anti-aliasing; draw as yellow and do not count as difference
+        // note that we do not include such pixels in a mask
+        if (output && !diffMask) {
+          drawPixel(output, pos, aaR, aaG, aaB);
+        }
+      } else {
+        // found substantial difference not caused by anti-aliasing; draw it as such
         if (output) {
-          drawGrayPixel(image1, pos, alpha, output)
-        }
-        continue;
-      }
-
-      // squared YUV distance between colors at this pixel position, negative if the img2 pixel is darker
-      const delta = a32[i] === b32[i] ? 0 : colorDelta(image1, image2, pos, pos, false);
-
-      // the color difference is above the threshold
-      if (Math.abs(delta) > maxDelta) {
-        // check it's a real rendering difference or just anti-aliasing
-        const isExcludedAA = !includeAA && (antialiased(image1, x, y, width, height, a32, b32) || antialiased(image2, x, y, width, height, b32, a32));
-        if (isExcludedAA) {
-          // one of the pixels is anti-aliasing; draw as yellow and do not count as difference
-          // note that we do not include such pixels in a mask
-          if (output && !diffMask) drawPixel(output, pos, aaR, aaG, aaB);
-
-        } else {
-          // found substantial difference not caused by anti-aliasing; draw it as such
-          if (output) {
-            if (delta < 0) {
-              drawPixel(output, pos, altR, altG, altB);
-            } else {
-              drawPixel(output, pos, diffR, diffG, diffB);
-            }
+          if (delta < 0) {
+            drawPixel(output, pos, altR, altG, altB);
+          } else {
+            drawPixel(output, pos, diffR, diffG, diffB);
           }
-          diff++;
         }
+        diff++;
 
-      } else if (output && !diffMask) {
-        // pixels are similar; draw background as grayscale image blended with white
-        drawGrayPixel(image1, pos, alpha, output);
+        if (failFastThreshold !== undefined && diff >= failFastThreshold) {
+          return diff;
+        }
       }
+    } else if (output && !diffMask) {
+      // pixels are similar; draw background as grayscale image blended with white
+      drawGrayPixel(image1, pos, alpha, output);
     }
   }
 
@@ -112,6 +117,60 @@ export default function stickerMatch(
 function isPixelData(array: ImageArray) {
   // work around instanceof Uint8Array not working properly in some Jest environments
   return ArrayBuffer.isView(array) && array.BYTES_PER_ELEMENT === 1;
+}
+
+
+// Conflicts are more likely to occur at the center than at the edges, so to fail faster we
+// compare the more central pixels first
+function* getPoints(width: number, height: number): Generator<readonly [x: number, y: number], undefined, undefined> {
+  const centerX = Math.floor(width / 2);
+  const centerY = Math.floor(height / 2);
+  const maxDistance = Math.max(Math.ceil(width / 2), Math.ceil(height / 2));
+
+  for (let d = 0; d < maxDistance; d++) {
+    if (d == 0) {
+      yield [centerX, centerY];
+      continue;
+    }
+    // d represents the distance from the center in Chebyshev distance.
+    // We process all the x, y pairs that far away form the center that are valid.
+
+    for (let s = 0; s < 4; s++) {
+      const points: Array<Readonly<[x: number, y: number]>> = [];
+
+      if (d == 0) {
+        points.push([centerX, centerY]);
+      } else {
+        if (s == 0 || s == 2) {
+          // top or bottom row (including the corners)
+          const y = centerY - d * (1 - s);
+          if (y < 0 || y >= height) {
+            continue;
+          }
+
+          const xStart = Math.max(centerX - d, 0);
+          const xStop = Math.min(centerX + d, width - 1);
+
+          for (let x = xStart; x <= xStop; x++) {
+            yield [x, y];
+          }
+        } else {
+          // left or right column (excluding the corners)
+          const x = centerX - d * (2 - s);
+          if (x < 0 || x >= width) {
+            continue;
+          }
+
+          const yStart = Math.max(centerY - d + 1, 0);
+          const yStop = Math.min(centerY + d - 1, height - 1);
+
+          for (let y = yStart; y <= yStop; y++) {
+            yield [x, y];
+          }
+        }
+      }
+    }
+  }
 }
 
 
